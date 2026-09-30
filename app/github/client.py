@@ -1,807 +1,578 @@
-# app/github/client.py — Async GitHub API client
+# app/config/schema.py — Pydantic v2 config schema & validation
+
 from __future__ import annotations
 
-import asyncio
-import time
-from datetime import datetime
-from typing import Any
+from typing import Literal, get_args
 
-import httpx
-import jwt
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.utils.logger import get_logger
-from app.utils.settings import settings
+from app.utils.safe_regex import validate_pattern
 
-log = get_logger("github.client")
+log = get_logger("config.schema")
 
-GITHUB_API = "https://api.github.com"
 
-# Safety valve for paginated endpoints: 100 items/page × 50 pages = 5000 items.
-# Large enough for any realistic repository, small enough that a runaway loop
-# can't burn an installation's whole rate-limit budget.
-MAX_PAGES = 50
+RoleLevel = Literal[
+    "contributor",
+    "junior-committer",
+    "committer",
+    "maintainer",
+]
 
-_PEM_MARKERS = [
-    (
-        "-----BEGIN RSA PRIVATE KEY-----",
-        "-----END RSA PRIVATE KEY-----",
-    ),
-    (
-        "-----BEGIN PRIVATE KEY-----",
-        "-----END PRIVATE KEY-----",
-    ),
-    (
-        "-----BEGIN EC PRIVATE KEY-----",
-        "-----END EC PRIVATE KEY-----",
-    ),
+FocusArea = Literal[
+    "security",
+    "performance",
+    "style",
+    "logic",
+    "tests",
+]
+
+AIProvider = Literal[
+    "auto",
+    "anthropic",
+    "openai",
+    "ollama",
+]
+
+MentorStrategy = Literal[
+    "round-robin",
+    "least-busy",
+    "expertise-match",
+]
+
+ReviewerAssignmentStrategy = Literal[
+    "round-robin",
+    "random",
+]
+
+ReviewerNotifyComment = Literal[
+    "off",
+    "mention",
+]
+
+Verdict = Literal[
+    "approve",
+    "request_changes",
+    "comment",
 ]
 
 
-def _normalize_private_key(raw: str) -> str:
-    """
-    Normalize GITHUB_PRIVATE_KEY into a valid multi-line PEM.
+# ---------------------------------------------------------------------------
+# Role requirements
+# ---------------------------------------------------------------------------
 
-    Supports:
-    - Already formatted PEM
-    - Escaped \n characters
-    - Flattened single-line PEM
-    - RSA, PKCS#8 and EC private keys
-    """
 
-    key = raw.replace("\\n", "\n").strip()
+class RoleRequirements(BaseModel):
+    min_merged_prs: int = Field(ge=0)
+    min_reviews_given: int = Field(ge=0)
+    min_months_active: int = Field(ge=0)
+    require_endorsement_from: RoleLevel
 
-    # Already a valid multi-line PEM
-    if "\n" in key and "BEGIN" in key and "END" in key:
-        return key
 
-    if "BEGIN" not in key or "END" not in key:
-        raise RuntimeError(
-            "Invalid GITHUB_PRIVATE_KEY. "
-            "Expected a PEM formatted private key."
-        )
+# ---------------------------------------------------------------------------
+# Onboarding
+# ---------------------------------------------------------------------------
 
-    for header, footer in _PEM_MARKERS:
-        if header in key and footer in key:
-            body = (
-                key.replace(header, "")
-                .replace(footer, "")
-                .strip()
-            )
 
-            return f"{header}\n{body}\n{footer}"
+class OnboardingConfig(BaseModel):
+    enabled: bool = True
 
-    raise RuntimeError(
-        "Unsupported GITHUB_PRIVATE_KEY format. "
-        "Supported PEM types are:\n"
-        "- RSA PRIVATE KEY\n"
-        "- PRIVATE KEY\n"
-        "- EC PRIVATE KEY"
+    # When true, heuristic bot-login detection runs on top of GitHub's own
+    # account type, catching bots that present as `type: User`. When false
+    # only accounts GitHub reports as `type: Bot` are skipped.
+    check_human_contributors: bool = True
+
+    # Gate `/assign` on the contributor appearing in the repo's CLA signature
+    # file. Fails closed: an unreadable or missing signature file blocks
+    # assignment rather than waving it through.
+    require_signed_cla: bool = False
+    cla_signatures_file: str = ".github/cla-signatures.json"
+    cla_document_url: str | None = None
+
+    # Post the welcome comment only for genuine first-time contributors.
+    welcome_first_time_only: bool = True
+
+    minimum_account_age_days: int = Field(default=0, ge=0)
+    minimum_public_contributions: int = Field(default=0, ge=0)
+
+    # Maximum number of open issues a contributor can hold in this repository.
+    # Set to null to disable the limit.
+    max_concurrent_assignments: int | None = Field(
+        default=None,
+        ge=1,
+    )
+
+    auto_assign_mentor: bool = False
+    mentor_assignment_strategy: MentorStrategy = "round-robin"
+
+    welcome_message: str | None = None
+
+    onboarding_checklist: list[str] = Field(
+        default_factory=list
     )
 
 
-class GitHubClient:
-    """Async GitHub App client. Generates installation tokens on demand."""
+# ---------------------------------------------------------------------------
+# Pull Request
+# ---------------------------------------------------------------------------
 
-    def __init__(self) -> None:
-        self._installation_tokens: dict[int, tuple[str, float]] = {}
-        # Per-installation asyncio locks to prevent thundering herd / race conditions
-        self._refresh_locks: dict[int, asyncio.Lock] = {}
-        self._http = httpx.AsyncClient(
-            base_url=GITHUB_API,
-            headers={
-                "Accept": "application/vnd.github+json",
-                "X-GitHub-Api-Version": "2022-11-28",
-            },
-            timeout=20.0,
-        )
 
-    # Auth
+class AIReviewConfig(BaseModel):
+    enabled: bool = False
+    model: str = "claude-sonnet-4-20250514"
 
-    def _make_jwt(self) -> str:
-        now = int(time.time())
+    max_comments: int = Field(
+        default=5,
+        ge=1,
+        le=20,
+    )
 
-        payload = {
-            "iat": now - 60,
-            "exp": now + 600,
-            "iss": settings.github_app_id,
-        }
+    focus_areas: list[FocusArea] = Field(
+        default_factory=lambda: [
+            "security",
+            "logic",
+        ]
+    )
 
-        private_key = _normalize_private_key(
-            settings.github_private_key
-        )
+    # Which model backend answers. "auto" picks the first configured backend
+    # in the registry order; naming one explicitly fails loudly if it is not
+    # configured, rather than quietly reviewing with a different model.
+    provider: AIProvider = "auto"
 
-        return jwt.encode(
-            payload,
-            private_key,
-            algorithm="RS256",
-        )
+    # Retries apply to transient backend failures only — a missing API key is
+    # never retried.
+    max_retries: int = Field(
+        default=2,
+        ge=0,
+        le=5,
+    )
 
-    async def _installation_token(self, installation_id: int) -> str:
-        # Initial cache check outside lock
-        token, expires_at = self._installation_tokens.get(installation_id, ("", 0.0))
-        if token and time.time() < expires_at - 60:
-            return token
+    # Maximum time allowed for each backend request.
+    timeout_seconds: int = Field(
+        default=60,
+        ge=5,
+        le=600,
+    )
 
-        # Fetch or create lock for this specific installation
-        lock = self._refresh_locks.setdefault(
-            installation_id,
-            asyncio.Lock(),
-        )
 
-        async with lock:
-            # Double-check cache inside lock in case another request refreshed it while waiting
-            token, expires_at = self._installation_tokens.get(installation_id, ("", 0.0))
-            if token and time.time() < expires_at - 60:
-                return token
+class QualityGatesConfig(BaseModel):
+    require_tests: bool = True
+    require_dco: bool = True
+    require_gpg_signature: bool = False
 
-            # Execute refresh request only if token is still expired
-            resp = await self._http.post(
-                f"/app/installations/{installation_id}/access_tokens",
-                headers={"Authorization": f"Bearer {self._make_jwt()}"},
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            token = data["token"]
+    min_reviewers: int = Field(
+        default=1,
+        ge=0,
+    )
 
-            # Parse exact expires_at from GitHub API response
-            expires_at_str = data.get("expires_at")
-            try:
-                if expires_at_str:
-                    expiry = datetime.fromisoformat(
-                        expires_at_str.replace("Z", "+00:00")
-                    ).timestamp()
-                else:
-                    expiry = time.time() + 3600
-            except (ValueError, TypeError):
-                expiry = time.time() + 3600
+    max_files_changed: int | None = Field(
+        default=None,
+        gt=0,
+    )
 
-            self._installation_tokens[installation_id] = (token, expiry)
-            return token
+    require_changelog_entry: bool = False
+    require_linked_issue: bool = False
+    allowed_branch_pattern: str | None = None
 
-    def _app_headers(self) -> dict[str, str]:
-        return {"Authorization": f"Bearer {self._make_jwt()}"}
-
-    async def _inst_headers(self, installation_id: int) -> dict[str, str]:
-        token = await self._installation_token(installation_id)
-        return {"Authorization": f"Bearer {token}"}
-
-    # Raw request
-
-    async def request(
-        self,
-        method: str,
-        path: str,
-        installation_id: int,
-        **kwargs: Any,
-    ) -> Any:
-        headers = await self._inst_headers(installation_id)
-        max_retries = 3
-        backoff = 1.0
-
-        for attempt in range(max_retries + 1):
-            try:
-                resp = await self._http.request(method, path, headers=headers, **kwargs)
-                if resp.status_code == 404:
-                    raise httpx.HTTPStatusError(
-                        "Not found", request=resp.request, response=resp
-                    )
-
-                # Retry on rate limiting (429) or transient gateway errors (502, 503, 504)
-                if resp.status_code in (429, 502, 503, 504) and attempt < max_retries:
-                    retry_after = resp.headers.get("Retry-After")
-                    sleep_time = float(retry_after) if retry_after else backoff
-                    log.warning(
-                        "GitHub API %s %s returned status %d. Retrying in %.1fs (attempt %d/%d)",
-                        method, path, resp.status_code, sleep_time, attempt + 1, max_retries,
-                    )
-                    await asyncio.sleep(sleep_time)
-                    backoff *= 2.0
-                    continue
-
-                resp.raise_for_status()
-                if resp.content:
-                    return resp.json()
-                return {}
-
-            except httpx.RequestError as exc:
-                if attempt < max_retries:
-                    log.warning(
-                        "GitHub API request network error on %s %s: %s. Retrying in %.1fs...",
-                        method, path, exc, backoff,
-                    )
-                    await asyncio.sleep(backoff)
-                    backoff *= 2.0
-                    continue
-                raise
-
-    async def get(self, path: str, installation_id: int, **kwargs: Any) -> Any:
-        return await self.request("GET", path, installation_id, **kwargs)
-
-    async def post(self, path: str, installation_id: int, **kwargs: Any) -> Any:
-        return await self.request("POST", path, installation_id, **kwargs)
-
-    async def patch(self, path: str, installation_id: int, **kwargs: Any) -> Any:
-        return await self.request("PATCH", path, installation_id, **kwargs)
-
-    async def delete(self, path: str, installation_id: int, **kwargs: Any) -> Any:
-        return await self.request("DELETE", path, installation_id, **kwargs)
-
-    # Pagination
-
-    async def paginate(
-        self,
-        path: str,
-        installation_id: int,
-        *,
-        params: dict[str, Any] | None = None,
-        per_page: int = 100,
-        max_pages: int = MAX_PAGES,
-        extract: str | None = None,
-    ) -> list[dict]:
-        """
-        Walk a paginated GitHub collection endpoint and return every item
-        up to the configured page cap.
-
-        The caller receives all collected items. If the page cap is reached,
-        a warning is emitted because the returned collection may be truncated.
-
-        ``extract`` names the key holding the list for endpoints that wrap
-        their results in an object.
-        """
-        items: list[dict] = []
-        page = 1
-
-        while page <= max_pages:
-            result = await self.get(
-                path,
-                installation_id,
-                params={**(params or {}), "per_page": per_page, "page": page},
-            )
-
-            batch = result.get(extract, []) if extract else result
-            if not isinstance(batch, list):
-                log.warning(
-                    "Unexpected paginated payload for %s (page %d): %s",
-                    path,
-                    page,
-                    type(batch).__name__,
-                )
-                return items
-
-            items.extend(batch)
-
-            if len(batch) < per_page:
-                return items
-
-            page += 1
-
-        log.warning(
-            "Pagination for %s reached the %d-page cap; results may be truncated",
-            path,
-            max_pages,
-        )
-        return items
-
-    async def count_assigned_open_issues(
-        self,
-        owner: str,
-        repo: str,
-        login: str,
-        installation_id: int,
-        *,
-        max_pages: int = MAX_PAGES,
-    ) -> int:
-        """Count open issues assigned to a user, excluding pull requests."""
-        items = await self.paginate(
-            f"/repos/{owner}/{repo}/issues",
-            installation_id,
-            params={
-                "assignee": login,
-                "state": "open",
-            },
-            per_page=100,
-            max_pages=max_pages,
-        )
-
-        return sum(1 for item in items if "pull_request" not in item)
-
-    async def _paginate_app(
-        self,
-        path: str,
-        *,
-        params: dict[str, Any] | None = None,
-        per_page: int = 100,
-        max_pages: int = MAX_PAGES,
-    ) -> list[dict]:
-        """Paginate an endpoint authenticated as the GitHub App."""
-        items: list[dict] = []
-        page = 1
-        max_retries = 3
-
-        while page <= max_pages:
-            backoff = 1.0
-
-            for attempt in range(max_retries + 1):
-                try:
-                    resp = await self._http.get(
-                        path,
-                        headers=self._app_headers(),
-                        params={
-                            **(params or {}),
-                            "per_page": per_page,
-                            "page": page,
-                        },
-                    )
-
-                    if (
-                        resp.status_code in (429, 502, 503, 504)
-                        and attempt < max_retries
-                    ):
-                        retry_after = resp.headers.get("Retry-After")
-                        sleep_time = (
-                            float(retry_after) if retry_after else backoff
-                        )
-                        log.warning(
-                            "GitHub App API %s page %d returned status %d. "
-                            "Retrying in %.1fs (attempt %d/%d)",
-                            path,
-                            page,
-                            resp.status_code,
-                            sleep_time,
-                            attempt + 1,
-                            max_retries,
-                        )
-                        await asyncio.sleep(sleep_time)
-                        backoff *= 2.0
-                        continue
-
-                    resp.raise_for_status()
-                    batch = resp.json()
-                    break
-
-                except httpx.RequestError as exc:
-                    if attempt >= max_retries:
-                        raise
-
-                    log.warning(
-                        "GitHub App API network error on %s page %d: %s. "
-                        "Retrying in %.1fs...",
-                        path,
-                        page,
-                        exc,
-                        backoff,
-                    )
-                    await asyncio.sleep(backoff)
-                    backoff *= 2.0
-            else:
-                raise RuntimeError(
-                    f"Unable to fetch paginated GitHub App endpoint: {path}"
-                )
-
-            if not isinstance(batch, list):
-                log.warning(
-                    "Unexpected app-level paginated payload for %s "
-                    "(page %d): %s",
-                    path,
-                    page,
-                    type(batch).__name__,
-                )
-                return items
-
-            items.extend(batch)
-
-            if len(batch) < per_page:
-                return items
-
-            page += 1
-
-        log.warning(
-            "App-level pagination for %s reached the %d-page cap; "
-            "results may be truncated",
-            path,
-            max_pages,
-        )
-        return items
-
-    # High-level helpers
-
-    async def get_file_content(
-        self,
-        owner: str,
-        repo: str,
-        path: str,
-        installation_id: int = 0,
-        ref: str | None = None,
+    @field_validator("allowed_branch_pattern")
+    @classmethod
+    def _branch_pattern_must_be_usable(
+        cls,
+        pattern: str | None,
     ) -> str | None:
-        """Returns base64-encoded file content or None if not found."""
-        try:
-            params = {"ref": ref} if ref else None
-            if installation_id:
-                data = await self.get(
-                    f"/repos/{owner}/{repo}/contents/{path}",
-                    installation_id,
-                    params=params,
-                )
-            else:
-                resp = await self._http.get(
-                    f"/repos/{owner}/{repo}/contents/{path}",
-                    headers=self._app_headers(),
-                    params=params,
-                )
-                if resp.status_code == 404:
-                    return None
-                resp.raise_for_status()
-                data = resp.json()
-            return data.get("content")
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 404:
-                return None
-            raise
+        # Matched against branch names chosen by PR authors on the event loop
+        # shared by every repository, so reject what cannot be matched safely.
+        return None if pattern is None else validate_pattern(pattern)
 
-    async def post_comment(
-        self, owner: str, repo: str, number: int, body: str, installation_id: int
-    ) -> None:
-        await self.post(
-            f"/repos/{owner}/{repo}/issues/{number}/comments",
-            installation_id,
-            json={"body": body},
+
+class PullRequestConfig(BaseModel):
+    enabled: bool = True
+
+    ai_review: AIReviewConfig = Field(
+        default_factory=AIReviewConfig
+    )
+
+    quality_gates: QualityGatesConfig = Field(
+        default_factory=QualityGatesConfig
+    )
+
+    auto_label: bool = True
+
+    stale_pr_days: int = Field(
+        default=30,
+        gt=0,
+    )
+
+    auto_close_stale: bool = False
+
+    reviewer_recommendation: bool = True
+
+
+# ---------------------------------------------------------------------------
+# Progression
+# ---------------------------------------------------------------------------
+
+
+class ProgressionConfig(BaseModel):
+    enabled: bool = True
+    recommend_issues_after_merge: bool = True
+
+    recommendation_count: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+    )
+
+    requirements_for_junior_committer: RoleRequirements = Field(
+        default_factory=lambda: RoleRequirements(
+            min_merged_prs=3,
+            min_reviews_given=2,
+            min_months_active=1,
+            require_endorsement_from="committer",
         )
+    )
 
-    async def list_issue_comments(
-        self,
-        owner: str,
-        repo: str,
-        number: int,
-        installation_id: int,
-    ) -> list[dict]:
-        comments: list[dict] = []
-        page = 1
-
-        while True:
-            result = await self.get(
-                f"/repos/{owner}/{repo}/issues/{number}/comments",
-                installation_id,
-                params={"per_page": 100, "page": page},
-            )
-
-            if not isinstance(result, list):
-                break
-
-            comments.extend(result)
-
-            if len(result) < 100:
-                break
-
-            page += 1
-
-        return comments
-
-    async def update_comment(
-        self,
-        owner: str,
-        repo: str,
-        comment_id: int,
-        body: str,
-        installation_id: int,
-    ) -> None:
-        await self.patch(
-            f"/repos/{owner}/{repo}/issues/comments/{comment_id}",
-            installation_id,
-            json={"body": body},
+    requirements_for_committer: RoleRequirements = Field(
+        default_factory=lambda: RoleRequirements(
+            min_merged_prs=15,
+            min_reviews_given=10,
+            min_months_active=6,
+            require_endorsement_from="maintainer",
         )
+    )
 
-    async def add_label(
-        self, owner: str, repo: str, number: int, label: str, installation_id: int
-    ) -> None:
-        # Ensure label exists
-        try:
-            await self.get(f"/repos/{owner}/{repo}/labels/{label}", installation_id)
-        except httpx.HTTPStatusError:
-            await self.post(
-                f"/repos/{owner}/{repo}/labels",
-                installation_id,
-                json={"name": label, "color": "ededed"},
-            )
-        await self.post(
-            f"/repos/{owner}/{repo}/issues/{number}/labels",
-            installation_id,
-            json={"labels": [label]},
+    requirements_for_maintainer: RoleRequirements = Field(
+        default_factory=lambda: RoleRequirements(
+            min_merged_prs=50,
+            min_reviews_given=30,
+            min_months_active=12,
+            require_endorsement_from="maintainer",
         )
+    )
 
-    async def remove_label(
-        self, owner: str, repo: str, number: int, label: str, installation_id: int
-    ) -> None:
-        """Remove a label from an issue/PR, tolerating it already being absent."""
-        try:
-            await self.delete(
-                f"/repos/{owner}/{repo}/issues/{number}/labels/{label}",
-                installation_id,
-            )
-        except httpx.HTTPStatusError:
-            # Label wasn't applied (404) or was already removed — nothing to do.
-            pass
+    celebrate_milestones: bool = True
 
-    async def add_assignees(
-        self,
-        owner: str,
-        repo: str,
-        number: int,
-        assignees: list[str],
-        installation_id: int,
-    ) -> None:
-        await self.post(
-            f"/repos/{owner}/{repo}/issues/{number}/assignees",
-            installation_id,
-            json={"assignees": assignees},
-        )
 
-    async def request_reviewers(
-        self,
-        owner: str,
-        repo: str,
-        pr_number: int,
-        reviewers: list[str],
-        installation_id: int,
-    ) -> None:
-        """Request reviews from one or more reviewers on a pull request."""
-        if not reviewers:
-            return
+# ---------------------------------------------------------------------------
+# Issue Management
+# ---------------------------------------------------------------------------
 
-        await self.post(
-            f"/repos/{owner}/{repo}/pulls/{pr_number}/requested_reviewers",
-            installation_id,
-            json={"reviewers": reviewers},
-        )
 
-    async def remove_assignees(
-        self,
-        owner: str,
-        repo: str,
-        number: int,
-        assignees: list[str],
-        installation_id: int,
-    ) -> None:
-        await self.delete(
-            f"/repos/{owner}/{repo}/issues/{number}/assignees",
-            installation_id,
-            json={"assignees": assignees},
-        )
+class LabelEscalationRule(BaseModel):
+    label: str
+    notify_team: str
 
-    async def close_issue(
-        self, owner: str, repo: str, number: int, installation_id: int
-    ) -> None:
-        await self.patch(
-            f"/repos/{owner}/{repo}/issues/{number}",
-            installation_id,
-            json={"state": "closed", "state_reason": "not_planned"},
-        )
+    after_hours: int = Field(
+        gt=0
+    )
 
-    async def list_issues(
-        self, owner: str, repo: str, installation_id: int, **params: Any
-    ) -> list[dict]:
-        """List issues across every page — repos with >100 open issues need this."""
-        return await self.paginate(
-            f"/repos/{owner}/{repo}/issues",
-            installation_id,
-            params=params,
-        )
 
-    async def list_pr_files(
-        self, owner: str, repo: str, pr_number: int, installation_id: int
-    ) -> list[dict]:
-        files = []
-        page = 1
-        while True:
-            data = await self.get(
-                f"/repos/{owner}/{repo}/pulls/{pr_number}/files",
-                installation_id,
-                params={"per_page": 100, "page": page},
-            )
-            if not data:
-                break
-            files.extend(data)
-            if len(data) < 100:
-                break
-            page += 1
-        return files
+class IssueManagementConfig(BaseModel):
+    # Opt-in: this workflow closes issues and unassigns people, so a config
+    # file that never mentions it must not switch it on.
+    enabled: bool = False
 
-    async def list_pr_commits(
-        self, owner: str, repo: str, pr_number: int, installation_id: int
-    ) -> list[dict]:
-        return await self.get(
-            f"/repos/{owner}/{repo}/pulls/{pr_number}/commits",
-            installation_id,
-            params={"per_page": 100},
-        )
+    stale_issue_days: int = Field(
+        default=60,
+        gt=0,
+    )
 
-    async def list_pr_reviews(
-        self,
-        owner: str,
-        repo: str,
-        pr_number: int,
-        installation_id: int,
-        *,
-        max_pages: int = MAX_PAGES,
-    ) -> list[dict]:
-        return await self.paginate(
-            f"/repos/{owner}/{repo}/pulls/{pr_number}/reviews",
-            installation_id,
-            max_pages=max_pages,
-        )
+    close_stale_after_days: int = Field(
+        default=7,
+        gt=0,
+    )
 
-    async def get_combined_status(
-        self, owner: str, repo: str, sha: str, installation_id: int
-    ) -> dict:
-        return await self.get(
-            f"/repos/{owner}/{repo}/commits/{sha}/status", installation_id
-        )
+    stale_label: str = "stale"
 
-    async def get_user(self, login: str, installation_id: int) -> dict:
-        return await self.get(f"/users/{login}", installation_id)
+    exempt_labels: list[str] = Field(
+        default_factory=lambda: [
+            "pinned",
+            "security",
+            "in-progress",
+        ]
+    )
 
-    async def search_issues(
-        self,
-        query: str,
-        installation_id: int,
-        *,
-        per_page: int = 100,
-        page: int = 1,
-        sort: str | None = None,
-        order: str | None = None,
-    ) -> dict:
-        """
-        Run a GitHub issue/PR search and return one result page.
-        """
-        params: dict[str, Any] = {
-            "q": query,
-            "per_page": per_page,
-            "page": page,
+    auto_unassign_inactive_days: int = Field(
+        default=14,
+        gt=0,
+    )
+
+    label_escalation_rules: list[LabelEscalationRule] = Field(
+        default_factory=list
+    )
+
+    create_good_first_issues: bool = False
+
+
+# ---------------------------------------------------------------------------
+# PR Health
+# ---------------------------------------------------------------------------
+
+
+# The signals the health score is computed from (see prhealth._compute_signals).
+HEALTH_SIGNALS = frozenset(
+    {
+        "has_tests",
+        "has_linked_issue",
+        "has_description",
+        "dco_signed",
+        "review_count",
+        "small_diff",
+    }
+)
+
+
+class PRHealthConfig(BaseModel):
+    enabled: bool = True
+
+    score_weights: dict[str, float] = Field(
+        default_factory=lambda: {
+            "has_tests": 0.25,
+            "has_linked_issue": 0.15,
+            "has_description": 0.15,
+            "dco_signed": 0.20,
+            "review_count": 0.15,
+            "small_diff": 0.10,
         }
-        if sort:
-            params["sort"] = sort
-        if order:
-            params["order"] = order
+    )
 
-        return await self.get("/search/issues", installation_id, params=params)
+    comment_threshold: int = Field(
+        default=60,
+        ge=0,
+        le=100,
+    )
 
-    async def paginate_search(
-        self,
-        query: str,
-        installation_id: int,
-        *,
-        per_page: int = 100,
-        max_pages: int = MAX_PAGES,
-        sort: str | None = None,
-        order: str | None = None,
-    ) -> list[dict]:
+    label_healthy_above: int = Field(
+        default=75,
+        ge=0,
+        le=100,
+    )
+
+    @field_validator("score_weights")
+    @classmethod
+    def _normalise_score_weights(
+        cls,
+        weights: dict[str, float],
+    ) -> dict[str, float]:
         """
-        Return all matching search results up to the configured page cap.
-        """
-        items: list[dict] = []
-        page = 1
+        Keep known signals only and scale the weights so they sum to 1.
 
-        while page <= max_pages:
-            result = await self.search_issues(
-                query,
-                installation_id,
-                per_page=per_page,
-                page=page,
-                sort=sort,
-                order=order,
+        Without this, overriding a single weight capped the best possible
+        score and a typo'd key scored nothing.
+        """
+        unknown = sorted(
+            set(weights) - HEALTH_SIGNALS
+        )
+
+        if unknown:
+            log.warning(
+                "Ignoring unknown pr_health.score_weights keys: %s",
+                ", ".join(unknown),
             )
 
-            batch = result.get("items", [])
-            if not isinstance(batch, list):
-                log.warning(
-                    "Unexpected search payload for %s (page %d): %s",
-                    query,
-                    page,
-                    type(batch).__name__,
+        known = {
+            name: weight
+            for name, weight in weights.items()
+            if name in HEALTH_SIGNALS
+        }
+
+        if any(weight < 0 for weight in known.values()):
+            raise ValueError(
+                "score_weights must not be negative"
+            )
+
+        total = sum(known.values())
+
+        if total <= 0:
+            raise ValueError(
+                "score_weights needs at least one known signal "
+                "with a positive weight"
+            )
+
+        return {
+            name: weight / total
+            for name, weight in known.items()
+        }
+
+
+class ReviewerAssignmentConfig(BaseModel):
+    enabled: bool = False
+
+    availability_file: str = ".github/reviewers.yml"
+
+    reviewers_count: int = Field(
+        default=1,
+        ge=1,
+    )
+
+    strategy: ReviewerAssignmentStrategy = "round-robin"
+
+    exclude_pr_author: bool = True
+
+    fallback_to_all_if_none_available: bool = True
+
+    notify_comment: ReviewerNotifyComment = "off"
+
+
+# ---------------------------------------------------------------------------
+# Teams & Labels
+# ---------------------------------------------------------------------------
+
+
+class TeamsConfig(BaseModel):
+    maintainers: str = "maintainers"
+    committers: str = "committers"
+    junior_committers: str = "junior-committers"
+    mentors: str = "mentors"
+
+
+class DifficultyLabels(BaseModel):
+    good_first_issue: str = "good first issue"
+    intermediate: str = "intermediate"
+    advanced: str = "advanced"
+
+
+# ---------------------------------------------------------------------------
+# Root
+# ---------------------------------------------------------------------------
+
+
+class WorkflowsConfig(BaseModel):
+    onboarding: OnboardingConfig = Field(
+        default_factory=OnboardingConfig
+    )
+
+    pull_request: PullRequestConfig = Field(
+        default_factory=PullRequestConfig
+    )
+
+    progression: ProgressionConfig = Field(
+        default_factory=ProgressionConfig
+    )
+
+    issue_management: IssueManagementConfig = Field(
+        default_factory=IssueManagementConfig
+    )
+
+    pr_health: PRHealthConfig = Field(
+        default_factory=PRHealthConfig
+    )
+
+    reviewer_assignment: ReviewerAssignmentConfig = Field(
+        default_factory=ReviewerAssignmentConfig
+    )
+
+
+class RepoConfig(BaseModel):
+    repo: str = Field(
+        pattern=r"^[a-zA-Z0-9_.\-]+/[a-zA-Z0-9_.\-]+$"
+    )
+
+    workflows: WorkflowsConfig = Field(
+        default_factory=WorkflowsConfig
+    )
+
+    difficulty_labels: DifficultyLabels = Field(
+        default_factory=DifficultyLabels
+    )
+
+    teams: TeamsConfig = Field(
+        default_factory=TeamsConfig
+    )
+
+    @model_validator(mode="after")
+    def validate_stale_order(self) -> RepoConfig:
+        issue_management = self.workflows.issue_management
+
+        if (
+            issue_management.close_stale_after_days
+            >= issue_management.stale_issue_days
+        ):
+            raise ValueError(
+                "close_stale_after_days must be less than "
+                "stale_issue_days"
+            )
+
+        return self
+
+
+# ---------------------------------------------------------------------------
+# Unknown-key detection
+# ---------------------------------------------------------------------------
+
+
+def _model_types(
+    annotation: object,
+) -> list[type[BaseModel]]:
+    """
+    Return every Pydantic model mentioned in a type annotation.
+
+    Handles nested annotations such as Optional, lists, and unions.
+    """
+    if (
+        isinstance(annotation, type)
+        and issubclass(annotation, BaseModel)
+    ):
+        return [annotation]
+
+    found: list[type[BaseModel]] = []
+
+    for arg in get_args(annotation):
+        found.extend(_model_types(arg))
+
+    return found
+
+
+def find_unknown_keys(
+    data: object,
+    model: type[BaseModel],
+    prefix: str = "",
+) -> list[str]:
+    """
+    Return paths of keys that ``model`` and its nested models do not define.
+
+    Pydantic ignores unknown keys by default, so a typo such as
+    ``quality_gate:`` can silently leave the defaults in force.
+    Callers can report these paths so the owner can fix them.
+    """
+    unknown: list[str] = []
+
+    if not isinstance(data, dict):
+        return unknown
+
+    for key, value in data.items():
+        path = f"{prefix}{key}"
+
+        field = model.model_fields.get(key)
+
+        if field is None:
+            unknown.append(path)
+            continue
+
+        nested_models = _model_types(field.annotation)
+
+        if not nested_models:
+            continue
+
+        nested_model = nested_models[0]
+
+        if isinstance(value, dict):
+            unknown.extend(
+                find_unknown_keys(
+                    value,
+                    nested_model,
+                    f"{path}.",
                 )
-                return items
-
-            items.extend(batch)
-
-            if len(batch) < per_page:
-                return items
-
-            page += 1
-
-        log.warning(
-            "Search pagination for %s reached the %d-page cap; "
-            "results may be truncated",
-            query,
-            max_pages,
-        )
-        return items
-
-    async def get_collaborator_permission(
-        self,
-        owner: str,
-        repo: str,
-        login: str,
-        installation_id: int,
-    ) -> str:
-        data = await self.get(
-            f"/repos/{owner}/{repo}/collaborators/{login}/permission",
-            installation_id,
-        )
-        return data.get("permission", "none")
-
-    async def list_team_members(
-        self, org: str, team_slug: str, installation_id: int
-    ) -> list[dict]:
-        try:
-            return await self.get(
-                f"/orgs/{org}/teams/{team_slug}/members",
-                installation_id,
-                params={"per_page": 100},
             )
-        except Exception:
-            return []
 
-    async def list_installations(self) -> list[dict]:
-        """Every installation of this app, across all pages."""
-        return await self._paginate_app("/app/installations")
+        elif isinstance(value, list):
+            for index, item in enumerate(value):
+                unknown.extend(
+                    find_unknown_keys(
+                        item,
+                        nested_model,
+                        f"{path}[{index}].",
+                    )
+                )
 
-    async def list_installation_repos(self, installation_id: int) -> list[dict]:
-        """Every repo an installation can see — the response wraps them in an object."""
-        return await self.paginate(
-            "/installation/repositories",
-            installation_id,
-            extract="repositories",
-        )
-
-    async def create_pr_review_comment(
-        self,
-        owner: str,
-        repo: str,
-        pr_number: int,
-        body: str,
-        path: str,
-        line: int,
-        commit_sha: str,
-        installation_id: int,
-    ) -> None:
-        try:
-            await self.post(
-                f"/repos/{owner}/{repo}/pulls/{pr_number}/comments",
-                installation_id,
-                json={
-                    "body": body,
-                    "path": path,
-                    "line": line,
-                    "side": "RIGHT",
-                    "commit_id": commit_sha,
-                },
-            )
-        except Exception as exc:
-            log.warning("Inline comment failed (path=%s line=%d): %s", path, line, exc)
-
-    async def list_commits(
-        self,
-        owner: str,
-        repo: str,
-        installation_id: int,
-        *,
-        path: str | None = None,
-        per_page: int = 30,
-    ) -> list[dict]:
-        """
-        Recent commits on the default branch, optionally scoped to one path.
-
-        Scoping by path is what makes reviewer recommendation cheap: GitHub does
-        the history walk server-side and returns only the commits that touched
-        that directory, so one request answers "who has worked here lately".
-        """
-        params: dict[str, Any] = {"per_page": per_page}
-        if path:
-            params["path"] = path
-
-        result = await self.get(
-            f"/repos/{owner}/{repo}/commits", installation_id, params=params
-        )
-        return result if isinstance(result, list) else []
-
-    async def close(self) -> None:
-        await self._http.aclose()
+    return unknown
